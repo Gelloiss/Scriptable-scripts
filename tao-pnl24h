@@ -21,7 +21,7 @@ const version = "1.0.2";
 
 /**
  * Loader-validated widget parameter name.
- * Expected format: preset id (string or number, e.g. "24", "main", "portfolio-1")
+ * Expected format: preset id (string or number, e.g. "24", "portfolio-1")
  */
 const widgetParameter = "preset_id";
 
@@ -31,7 +31,7 @@ const widgetParameter = "preset_id";
 const TAO_RADAR_BASE_URL = "https://gateway.tao-radar.space/api/";
 const TAO_STATS_ACCOUNT_URL = "https://api.taostats.io/api/account/latest/v1";
 
-// IMPORTANT: header must stay EXACTLY as provided
+// IMPORTANT: header must stay EXACTLY as provided (not from variables)
 const TAO_STATS_HEADERS = {
   Authorization: "tao-50da5cad-e47e-483f-9599-5b5ede062579:43b67b81",
   accept: "application/json",
@@ -68,16 +68,20 @@ const RAO = 1e-9;
 // ============================
 
 /**
+ * Create the widget
+ *
+ * CONTRACT:
  * @param {{widgetParameter: string, debug: boolean, widgetFamily: string, apiKey: string, loaderVersion: string}} config
  * @returns {Promise<ListWidget>}
  */
 async function createWidget(config) {
   const debug = !!config?.debug;
   const log = debug ? console.log.bind(console) : () => {};
-
   const family = config?.widgetFamily || "large";
 
-  // Provided by loader
+  // Provided by loader:
+  // - config.widgetParameter: preset id (string)
+  // - config.apiKey: auth token
   const presetId = String(config?.widgetParameter ?? "").trim();
   const authToken = String(config?.apiKey ?? "").trim();
 
@@ -86,7 +90,8 @@ async function createWidget(config) {
   if (!presetId) {
     return createErrorWidget(
       `Missing preset id.\n` +
-      `Please provide widget parameter "${widgetParameter}".`
+      `Please provide widget parameter "${widgetParameter}".\n` +
+      `Example: 24`
     );
   }
 
@@ -102,7 +107,7 @@ async function createWidget(config) {
     const addresses = Array.isArray(preset.addresses) ? preset.addresses : [];
 
     if (addresses.length === 0) {
-      return createErrorWidget(`Preset "${presetId}" has no addresses.`);
+      return createErrorWidget(`Preset "${presetId}" has no addresses (or invalid response).`);
     }
 
     const rows = await fetchAllAccounts(addresses);
@@ -111,7 +116,7 @@ async function createWidget(config) {
     widget.refreshAfterDate = new Date(Date.now() + ENV.refreshInterval);
     return widget;
   } catch (e) {
-    return createErrorWidget(`Error:\n${e?.message ?? String(e)}`);
+    return createErrorWidget(`Error:\n${e && e.message ? e.message : String(e)}`);
   }
 }
 
@@ -129,9 +134,9 @@ async function fetchPreset(presetId, authToken) {
   };
 
   const data = await req.load();
-  const status = req.response?.statusCode ?? 0;
+  const status = req.response ? req.response.statusCode : 0;
 
-  if (status === 401 || status === 403) throw new Error("Preset auth failed.");
+  if (status === 401 || status === 403) throw new Error("Preset auth failed. Check apiKey/authToken.");
   if (status === 404) throw new Error(`Preset "${presetId}" not found.`);
   if (status !== 200) throw new Error(`Preset request failed (status: ${status}).`);
 
@@ -151,12 +156,12 @@ async function fetchAccount(address) {
   req.headers = TAO_STATS_HEADERS;
 
   const data = await req.load();
-  const status = req.response?.statusCode ?? 0;
+  const status = req.response ? req.response.statusCode : 0;
 
   if (status !== 200) throw new Error(`taostats request failed (status: ${status})`);
 
   const json = JSON.parse(data.toRawString());
-  if (!json || !Array.isArray(json.data)) throw new Error("Invalid taostats response.");
+  if (!json || !Array.isArray(json.data)) throw new Error("Invalid taostats response (missing data).");
   return json.data[0] || null;
 }
 
@@ -172,27 +177,28 @@ async function fetchAllAccounts(addresses) {
         try {
           const account = await fetchAccount(addr);
           if (!account) {
-            return { address: addr, totalBalance: null, dailyIncome: null, error: "No data" };
+            return { address: addr, totalBalance: null, dailyIncome: null, error: "No data for address" };
           }
 
-          const total = Number(account.balance_total);
-          const total24 = Number(account.balance_total_24hr_ago);
+          const balanceTotal = toNumber(account.balance_total);
+          const balanceTotal24 = toNumber(account.balance_total_24hr_ago);
 
-          if (!Number.isFinite(total) || !Number.isFinite(total24)) {
-            return { address: addr, totalBalance: null, dailyIncome: null, error: "Invalid balance" };
+          if (!Number.isFinite(balanceTotal) || !Number.isFinite(balanceTotal24)) {
+            return { address: addr, totalBalance: null, dailyIncome: null, error: "Invalid balance values" };
           }
 
-          return {
-            address: addr,
-            totalBalance: ceil2AwayFromZero(total * RAO),
-            dailyIncome: ceil2AwayFromZero((total - total24) * RAO),
-          };
+          // totalBalance = balance_total * 1e-9
+          // dailyIncome = (balance_total - balance_total_24hr_ago) * 1e-9
+          const totalBalance = ceil2AwayFromZero(balanceTotal * RAO);
+          const dailyIncome = ceil2AwayFromZero((balanceTotal - balanceTotal24) * RAO);
+
+          return { address: addr, totalBalance, dailyIncome };
         } catch (e) {
           return {
             address: addr,
             totalBalance: null,
             dailyIncome: null,
-            error: e?.message ?? String(e),
+            error: e && e.message ? e.message : String(e),
           };
         }
       })
@@ -205,13 +211,156 @@ async function fetchAllAccounts(addresses) {
 }
 
 // ============================
-// Rendering + helpers (без изменений)
+// Rendering
 // ============================
 
-/* … остальная часть рендера и helper-функции остаются без изменений … */
+function createPortfolioWidget(rows, widgetFamily) {
+  const widget = new ListWidget();
+  widget.backgroundColor = ENV.colors.bg;
+
+  const frame = widget.addStack();
+  frame.layoutVertically();
+  frame.spacing = ENV.part_spacing;
+
+  if (widgetFamily === "small") {
+    drawSmall(frame, rows);
+  } else {
+    drawTable(frame, rows);
+    drawTimeUpdated(frame);
+  }
+
+  return widget;
+}
+
+function drawTable(frame, rows) {
+  const table = frame.addStack();
+  table.layoutHorizontally();
+  table.centerAlignContent();
+
+  const createColumn = (title, color) => {
+    const stack = table.addStack();
+    stack.layoutVertically();
+    stack.spacing = ENV.spacing;
+    addText(stack, title, ENV.fonts.columnHeader, color, true);
+    return stack;
+  };
+
+  const colAddr = createColumn("Address", ENV.colors.cyan_green);
+  table.addSpacer();
+  const colTotal = createColumn("Total", ENV.colors.gold);
+  table.addSpacer();
+  const colDaily = createColumn("Daily", ENV.colors.white);
+
+  rows.forEach((r) => {
+    if (!r.error) {
+      addText(colAddr, shortAddress(r.address), ENV.fonts.value, ENV.colors.cyan_green, true);
+      addText(colTotal, format2(r.totalBalance), ENV.fonts.value, ENV.colors.gold, true);
+      addText(colDaily, format2(r.dailyIncome), ENV.fonts.value, ENV.colors.white, true);
+    } else {
+      addText(colAddr, `${shortAddress(r.address)} ⚠️`, ENV.fonts.value, ENV.colors.err, true);
+      addText(colTotal, "-", ENV.fonts.value, ENV.colors.err, true);
+      addText(colDaily, "-", ENV.fonts.value, ENV.colors.err, true);
+    }
+  });
+}
+
+function drawSmall(frame, rows) {
+  const header = frame.addStack();
+  header.layoutHorizontally();
+  addText(header, "Address", ENV.fonts.columnHeader, ENV.colors.cyan_green, true);
+  header.addSpacer();
+  addText(header, "Total", ENV.fonts.columnHeader, ENV.colors.gold, true);
+  header.addSpacer();
+  addText(header, "Daily", ENV.fonts.columnHeader, ENV.colors.white, true);
+
+  frame.addSpacer(6);
+
+  rows.slice(0, 3).forEach((r) => {
+    const row = frame.addStack();
+    row.layoutHorizontally();
+
+    addText(row, shortAddress(r.address), ENV.fonts.value, r.error ? ENV.colors.err : ENV.colors.cyan_green, true);
+    row.addSpacer();
+    addText(row, r.error ? "-" : format2(r.totalBalance), ENV.fonts.value, r.error ? ENV.colors.err : ENV.colors.gold, true);
+    row.addSpacer();
+    addText(row, r.error ? "-" : format2(r.dailyIncome), ENV.fonts.value, r.error ? ENV.colors.err : ENV.colors.white, true);
+  });
+
+  frame.addSpacer(6);
+  drawTimeUpdated(frame);
+}
+
+function createErrorWidget(message) {
+  const widget = new ListWidget();
+  widget.backgroundColor = ENV.colors.bg;
+
+  const stack = widget.addStack();
+  stack.layoutVertically();
+  stack.centerAlignContent();
+
+  addText(stack, "⚠️ Error", ENV.fonts.errorTitle, ENV.colors.err, true);
+  stack.addSpacer(10);
+
+  String(message)
+    .split("\n")
+    .forEach((line) => addText(stack, line, ENV.fonts.default, ENV.colors.gray));
+
+  return widget;
+}
+
+function drawTimeUpdated(stack) {
+  const timeStack = stack.addStack();
+  timeStack.addSpacer();
+  addText(timeStack, "Sync: ", ENV.fonts.sync, ENV.colors.gray);
+
+  const date = timeStack.addDate(new Date());
+  date.textColor = ENV.colors.gray;
+  date.font = Font.systemFont(ENV.fonts.sync);
+  date.applyTimeStyle();
+
+  timeStack.addSpacer();
+}
+
+function addText(frame, text, size, color, isSemibold = false) {
+  const t = frame.addText(String(text));
+  t.font = isSemibold ? Font.semiboldSystemFont(size) : Font.systemFont(size);
+  t.textColor = color;
+  t.lineLimit = 1;
+}
 
 // ============================
-// Required exports
+// Helpers
+// ============================
+
+function shortAddress(addr) {
+  const s = String(addr || "");
+  if (s.length <= 14) return s;
+  return `${s.slice(0, 6)}...${s.slice(-6)}`;
+}
+
+function toNumber(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : NaN;
+}
+
+/**
+ * "Round up" to 2 decimals away from zero.
+ * -  1.231 ->  1.24
+ * - -1.231 -> -1.24
+ */
+function ceil2AwayFromZero(x) {
+  if (!Number.isFinite(x)) return NaN;
+  const sign = x < 0 ? -1 : 1;
+  return sign * (Math.ceil(Math.abs(x) * 100) / 100);
+}
+
+function format2(n) {
+  if (!Number.isFinite(n)) return "-";
+  return n.toFixed(2);
+}
+
+// ============================
+// Required exports (loader compatible)
 // ============================
 
 module.exports = {
