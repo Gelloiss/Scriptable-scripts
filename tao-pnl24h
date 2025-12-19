@@ -9,15 +9,15 @@
  * Displays per-address balances for a preset:
  * - Address (short)
  * - Total balance (TAO)
- * - Daily delta (TAO) = current - 24h_ago (can be negative)
+ * - 24h change (TAO) = current - 24h_ago (can be negative)
  *
  * Works with TAO Radar loader (main.js).
  *
  * @author Gelloiss <gelloiss@gmail.com>
- * @version 1.0.2
+ * @version 1.0.3
  */
 
-const version = "1.0.2";
+const version = "1.0.3";
 
 /**
  * Loader-validated widget parameter name.
@@ -90,21 +90,21 @@ async function createWidget(config) {
   if (!presetId) {
     return createErrorWidget(
       `Missing preset id.\n` +
-      `Please provide widget parameter "${widgetParameter}".\n` +
-      `Example: 24`
+        `Please provide widget parameter "${widgetParameter}".\n` +
+        `Example: 24`
     );
   }
 
   if (!authToken) {
     return createErrorWidget(
       `Missing API key (auth token).\n` +
-      `Provide it as apiKey in loader config.`
+        `Provide it as apiKey in loader config.`
     );
   }
 
   try {
     const preset = await fetchPreset(presetId, authToken);
-    const addresses = Array.isArray(preset.addresses) ? preset.addresses : [];
+    const addresses = Array.isArray(preset?.addresses) ? preset.addresses : [];
 
     if (addresses.length === 0) {
       return createErrorWidget(`Preset "${presetId}" has no addresses (or invalid response).`);
@@ -177,27 +177,27 @@ async function fetchAllAccounts(addresses) {
         try {
           const account = await fetchAccount(addr);
           if (!account) {
-            return { address: addr, totalBalance: null, dailyIncome: null, error: "No data for address" };
+            return { address: addr, totalBalance: null, change24h: null, error: "No data for address" };
           }
 
           const balanceTotal = toNumber(account.balance_total);
           const balanceTotal24 = toNumber(account.balance_total_24hr_ago);
 
           if (!Number.isFinite(balanceTotal) || !Number.isFinite(balanceTotal24)) {
-            return { address: addr, totalBalance: null, dailyIncome: null, error: "Invalid balance values" };
+            return { address: addr, totalBalance: null, change24h: null, error: "Invalid balance values" };
           }
 
           // totalBalance = balance_total * 1e-9
-          // dailyIncome = (balance_total - balance_total_24hr_ago) * 1e-9
+          // change24h     = (balance_total - balance_total_24hr_ago) * 1e-9  (positive = growth)
           const totalBalance = ceil2AwayFromZero(balanceTotal * RAO);
-          const dailyIncome = ceil2AwayFromZero((balanceTotal - balanceTotal24) * RAO);
+          const change24h = ceil2AwayFromZero((balanceTotal - balanceTotal24) * RAO);
 
-          return { address: addr, totalBalance, dailyIncome };
+          return { address: addr, totalBalance, change24h };
         } catch (e) {
           return {
             address: addr,
             totalBalance: null,
-            dailyIncome: null,
+            change24h: null,
             error: e && e.message ? e.message : String(e),
           };
         }
@@ -249,13 +249,13 @@ function drawTable(frame, rows) {
   table.addSpacer();
   const colTotal = createColumn("Total", ENV.colors.gold);
   table.addSpacer();
-  const colDaily = createColumn("Daily", ENV.colors.white);
+  const colDaily = createColumn("24h Δ", ENV.colors.white);
 
   rows.forEach((r) => {
     if (!r.error) {
       addText(colAddr, shortAddress(r.address), ENV.fonts.value, ENV.colors.cyan_green, true);
       addText(colTotal, format2(r.totalBalance), ENV.fonts.value, ENV.colors.gold, true);
-      addText(colDaily, format2(r.dailyIncome), ENV.fonts.value, ENV.colors.white, true);
+      addText(colDaily, formatSigned2(r.change24h), ENV.fonts.value, ENV.colors.white, true);
     } else {
       addText(colAddr, `${shortAddress(r.address)} ⚠️`, ENV.fonts.value, ENV.colors.err, true);
       addText(colTotal, "-", ENV.fonts.value, ENV.colors.err, true);
@@ -271,7 +271,7 @@ function drawSmall(frame, rows) {
   header.addSpacer();
   addText(header, "Total", ENV.fonts.columnHeader, ENV.colors.gold, true);
   header.addSpacer();
-  addText(header, "Daily", ENV.fonts.columnHeader, ENV.colors.white, true);
+  addText(header, "24h Δ", ENV.fonts.columnHeader, ENV.colors.white, true);
 
   frame.addSpacer(6);
 
@@ -283,7 +283,7 @@ function drawSmall(frame, rows) {
     row.addSpacer();
     addText(row, r.error ? "-" : format2(r.totalBalance), ENV.fonts.value, r.error ? ENV.colors.err : ENV.colors.gold, true);
     row.addSpacer();
-    addText(row, r.error ? "-" : format2(r.dailyIncome), ENV.fonts.value, r.error ? ENV.colors.err : ENV.colors.white, true);
+    addText(row, r.error ? "-" : formatSigned2(r.change24h), ENV.fonts.value, r.error ? ENV.colors.err : ENV.colors.white, true);
   });
 
   frame.addSpacer(6);
@@ -357,6 +357,12 @@ function ceil2AwayFromZero(x) {
 function format2(n) {
   if (!Number.isFinite(n)) return "-";
   return n.toFixed(2);
+}
+
+function formatSigned2(n) {
+  if (!Number.isFinite(n)) return "-";
+  const s = n.toFixed(2);
+  return n > 0 ? `+${s}` : s;
 }
 
 // ============================
