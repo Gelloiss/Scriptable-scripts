@@ -1,0 +1,378 @@
+// Variables used by Scriptable.
+// These must be at the very top of the file. Do not edit.
+// icon-color: blue; icon-glyph: code;
+//@ts-check
+
+/**
+ * TAO Radar Preset Portfolio Widget
+ *
+ * Displays per-address balances for a preset:
+ * - Address (short)
+ * - Total balance (TAO)
+ * - Daily delta (TAO) = current - 24h_ago (can be negative)
+ *
+ * Works with TAO Radar loader (main.js).
+ *
+ * @author Gelloiss <gelloiss@gmail.com>
+ * @version 1.0.1
+ */
+
+const version = "1.0.1";
+
+/**
+ * Loader-validated widget parameter name.
+ * Expected format: integer preset id (e.g. "24")
+ */
+const widgetParameter = "preset_id";
+
+// ============================
+// API
+// ============================
+const TAO_RADAR_BASE_URL = "https://gateway.tao-radar.space/api/";
+const TAO_STATS_ACCOUNT_URL = "https://api.taostats.io/api/account/latest/v1";
+
+// IMPORTANT: header must stay EXACTLY as provided (not from variables)
+const TAO_STATS_HEADERS = {
+  Authorization: "tao-50da5cad-e47e-483f-9599-5b5ede062579:43b67b81",
+  accept: "application/json",
+};
+
+// ============================
+// UI ENV
+// ============================
+const ENV = {
+  colors: {
+    bg: new Color("#0E0E0E"),
+    err: new Color("#ad4904"),
+    gold: new Color("#FDE047"),
+    white: Color.white(),
+    cyan_green: new Color("#00c2a6"),
+    gray: Color.gray(),
+  },
+  spacing: 4,
+  part_spacing: 7,
+  refreshInterval: 300000,
+  fonts: {
+    errorTitle: 20,
+    columnHeader: 13,
+    value: 12,
+    sync: 11,
+    default: 12,
+  },
+};
+
+const RAO = 1e-9;
+
+// ============================
+// Main widget function (CONTRACT)
+// ============================
+
+/**
+ * Create the widget
+ *
+ * CONTRACT:
+ * @param {{widgetParameter: string, debug: boolean, widgetFamily: string, apiKey: string, loaderVersion: string}} config
+ * @returns {Promise<ListWidget>}
+ */
+async function createWidget(config) {
+  const debug = !!config?.debug;
+  const log = debug ? console.log.bind(console) : () => {};
+
+  const family = config?.widgetFamily || "large";
+
+  // Provided by loader:
+  // - config.widgetParameter: preset id
+  // - config.apiKey: auth token
+  const presetIdRaw = (config?.widgetParameter ?? "").trim();
+  const authToken = (config?.apiKey ?? "").trim();
+
+  const presetId = parseIntSafe(presetIdRaw);
+
+  log(`[PresetWidget] family=${family} presetIdRaw="${presetIdRaw}" presetId=${presetId} hasApiKey=${!!authToken}`);
+
+  if (!Number.isFinite(presetId) || presetId <= 0) {
+    return createErrorWidget(
+      `Invalid preset id.\n` +
+      `Expected integer in widget parameter "${widgetParameter}".\n` +
+      `Example: 24`
+    );
+  }
+
+  if (!authToken) {
+    return createErrorWidget(
+      `Missing API key (auth token).\n` +
+      `Provide it as apiKey in loader config.`
+    );
+  }
+
+  try {
+    const preset = await fetchPreset(presetId, authToken);
+    const addresses = Array.isArray(preset.addresses) ? preset.addresses : [];
+
+    if (addresses.length === 0) {
+      return createErrorWidget(`Preset ${presetId} has no addresses (or invalid response).`);
+    }
+
+    const rows = await fetchAllAccounts(addresses);
+
+    const widget = createPortfolioWidget(rows, family);
+    widget.refreshAfterDate = new Date(Date.now() + ENV.refreshInterval);
+    return widget;
+  } catch (e) {
+    return createErrorWidget(`Error:\n${e && e.message ? e.message : String(e)}`);
+  }
+}
+
+// ============================
+// Fetching
+// ============================
+
+async function fetchPreset(presetId, authToken) {
+  const url = `${TAO_RADAR_BASE_URL}presets/${encodeURIComponent(presetId)}`;
+  const req = new Request(url);
+  req.method = "GET";
+  req.headers = {
+    accept: "application/json",
+    "X-API-Key": authToken,
+  };
+
+  const data = await req.load();
+  const status = req.response ? req.response.statusCode : 0;
+
+  if (status === 401 || status === 403) throw new Error("Preset auth failed. Check apiKey/authToken.");
+  if (status === 404) throw new Error(`Preset ${presetId} not found.`);
+  if (status !== 200) throw new Error(`Preset request failed (status: ${status}).`);
+
+  const json = JSON.parse(data.toRawString());
+  if (!json || !Array.isArray(json.addresses)) throw new Error("Invalid preset response.");
+  return json;
+}
+
+async function fetchAccount(address) {
+  const url =
+    `${TAO_STATS_ACCOUNT_URL}` +
+    `?address=${encodeURIComponent(address)}` +
+    `&network=Finney&page=1&limit=50`;
+
+  const req = new Request(url);
+  req.method = "GET";
+  req.headers = TAO_STATS_HEADERS;
+
+  const data = await req.load();
+  const status = req.response ? req.response.statusCode : 0;
+
+  if (status !== 200) throw new Error(`taostats request failed (status: ${status})`);
+
+  const json = JSON.parse(data.toRawString());
+  if (!json || !Array.isArray(json.data)) throw new Error("Invalid taostats response (missing data).");
+  return json.data[0] || null;
+}
+
+async function fetchAllAccounts(addresses) {
+  const concurrency = 5;
+  const out = [];
+
+  for (let i = 0; i < addresses.length; i += concurrency) {
+    const batch = addresses.slice(i, i + concurrency);
+
+    const results = await Promise.all(
+      batch.map(async (addr) => {
+        try {
+          const account = await fetchAccount(addr);
+          if (!account) {
+            return { address: addr, totalBalance: null, dailyIncome: null, error: "No data for address" };
+          }
+
+          const balanceTotal = toNumber(account.balance_total);
+          const balanceTotal24 = toNumber(account.balance_total_24hr_ago);
+
+          if (!Number.isFinite(balanceTotal) || !Number.isFinite(balanceTotal24)) {
+            return { address: addr, totalBalance: null, dailyIncome: null, error: "Invalid balance values" };
+          }
+
+          // totalBalance = balance_total * 1e-9
+          // dailyIncome = (balance_total - balance_total_24hr_ago) * 1e-9
+          const totalBalance = ceil2AwayFromZero(balanceTotal * RAO);
+          const dailyIncome = ceil2AwayFromZero((balanceTotal - balanceTotal24) * RAO);
+
+          return { address: addr, totalBalance, dailyIncome };
+        } catch (e) {
+          return {
+            address: addr,
+            totalBalance: null,
+            dailyIncome: null,
+            error: e && e.message ? e.message : String(e),
+          };
+        }
+      })
+    );
+
+    out.push(...results);
+  }
+
+  return out;
+}
+
+// ============================
+// Rendering
+// ============================
+
+function createPortfolioWidget(rows, widgetFamily) {
+  const widget = new ListWidget();
+  widget.backgroundColor = ENV.colors.bg;
+
+  const frame = widget.addStack();
+  frame.layoutVertically();
+  frame.spacing = ENV.part_spacing;
+
+  if (widgetFamily === "small") {
+    drawSmall(frame, rows);
+  } else {
+    drawTable(frame, rows);
+    drawTimeUpdated(frame);
+  }
+
+  return widget;
+}
+
+function drawTable(frame, rows) {
+  const table = frame.addStack();
+  table.layoutHorizontally();
+  table.centerAlignContent();
+
+  const createColumn = (title, color) => {
+    const stack = table.addStack();
+    stack.layoutVertically();
+    stack.spacing = ENV.spacing;
+    addText(stack, title, ENV.fonts.columnHeader, color, true);
+    return stack;
+  };
+
+  const colAddr = createColumn("Address", ENV.colors.cyan_green);
+  table.addSpacer();
+  const colTotal = createColumn("Total", ENV.colors.gold);
+  table.addSpacer();
+  const colDaily = createColumn("Daily", ENV.colors.white);
+
+  rows.forEach((r) => {
+    if (!r.error) {
+      addText(colAddr, shortAddress(r.address), ENV.fonts.value, ENV.colors.cyan_green, true);
+      addText(colTotal, format2(r.totalBalance), ENV.fonts.value, ENV.colors.gold, true);
+      addText(colDaily, format2(r.dailyIncome), ENV.fonts.value, ENV.colors.white, true);
+    } else {
+      addText(colAddr, `${shortAddress(r.address)} ⚠️`, ENV.fonts.value, ENV.colors.err, true);
+      addText(colTotal, "-", ENV.fonts.value, ENV.colors.err, true);
+      addText(colDaily, "-", ENV.fonts.value, ENV.colors.err, true);
+    }
+  });
+}
+
+function drawSmall(frame, rows) {
+  const header = frame.addStack();
+  header.layoutHorizontally();
+  addText(header, "Address", ENV.fonts.columnHeader, ENV.colors.cyan_green, true);
+  header.addSpacer();
+  addText(header, "Total", ENV.fonts.columnHeader, ENV.colors.gold, true);
+  header.addSpacer();
+  addText(header, "Daily", ENV.fonts.columnHeader, ENV.colors.white, true);
+
+  frame.addSpacer(6);
+
+  rows.slice(0, 3).forEach((r) => {
+    const row = frame.addStack();
+    row.layoutHorizontally();
+
+    addText(row, shortAddress(r.address), ENV.fonts.value, r.error ? ENV.colors.err : ENV.colors.cyan_green, true);
+    row.addSpacer();
+    addText(row, r.error ? "-" : format2(r.totalBalance), ENV.fonts.value, r.error ? ENV.colors.err : ENV.colors.gold, true);
+    row.addSpacer();
+    addText(row, r.error ? "-" : format2(r.dailyIncome), ENV.fonts.value, r.error ? ENV.colors.err : ENV.colors.white, true);
+  });
+
+  frame.addSpacer(6);
+  drawTimeUpdated(frame);
+}
+
+function createErrorWidget(message) {
+  const widget = new ListWidget();
+  widget.backgroundColor = ENV.colors.bg;
+
+  const stack = widget.addStack();
+  stack.layoutVertically();
+  stack.centerAlignContent();
+
+  addText(stack, "⚠️ Error", ENV.fonts.errorTitle, ENV.colors.err, true);
+  stack.addSpacer(10);
+
+  String(message)
+    .split("\n")
+    .forEach((line) => addText(stack, line, ENV.fonts.default, ENV.colors.gray));
+
+  return widget;
+}
+
+function drawTimeUpdated(stack) {
+  const timeStack = stack.addStack();
+  timeStack.addSpacer();
+  addText(timeStack, "Sync: ", ENV.fonts.sync, ENV.colors.gray);
+
+  const date = timeStack.addDate(new Date());
+  date.textColor = ENV.colors.gray;
+  date.font = Font.systemFont(ENV.fonts.sync);
+  date.applyTimeStyle();
+
+  timeStack.addSpacer();
+}
+
+function addText(frame, text, size, color, isSemibold = false) {
+  const t = frame.addText(String(text));
+  t.font = isSemibold ? Font.semiboldSystemFont(size) : Font.systemFont(size);
+  t.textColor = color;
+  t.lineLimit = 1;
+}
+
+// ============================
+// Helpers
+// ============================
+
+function shortAddress(addr) {
+  const s = String(addr || "");
+  if (s.length <= 14) return s;
+  return `${s.slice(0, 6)}...${s.slice(-6)}`;
+}
+
+function toNumber(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : NaN;
+}
+
+function parseIntSafe(s) {
+  const n = parseInt(String(s), 10);
+  return Number.isFinite(n) ? n : NaN;
+}
+
+/**
+ * "Round up" to 2 decimals away from zero.
+ * -  1.231 ->  1.24
+ * - -1.231 -> -1.24
+ */
+function ceil2AwayFromZero(x) {
+  if (!Number.isFinite(x)) return NaN;
+  const sign = x < 0 ? -1 : 1;
+  return sign * (Math.ceil(Math.abs(x) * 100) / 100);
+}
+
+function format2(n) {
+  if (!Number.isFinite(n)) return "-";
+  return n.toFixed(2);
+}
+
+// ============================
+// Required exports (loader compatible)
+// ============================
+
+module.exports = {
+  version,
+  widgetParameter,
+  createWidget,
+};
